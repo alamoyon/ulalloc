@@ -8,18 +8,17 @@
 #else
   #include <sys/mman.h>
   #include <unistd.h>
-  #include <pthread.h>
 #endif
-                                 // (...111100) The least siginifcant bit is used for the `been_freed` flag
-#define MAX_SIZE ~(size_t)3      // And the second least significant bit is used for the `prev_free` flag
-#define MIN_SIZE  32             // Mimimum MIN_SIZE for storing the linked list node + header + footer data when freed
-#define PAGE_SIZE 4096           // 4KiB Hard coded
-#define MIN_ALLOC PAGE_SIZE * 16 // 64KiB
-#define PAYLOAD_ALIGN 16         // 16 byte payload alignment
-#define NUM_BUCKETS 11           // from 32B to 32KiB+, each bucket doubling
-#define BEEN_FREED_MASK 1        // AND for read, OR to write 1, INVERT mask + AND to write 0
-#define PREV_FREE_MASK (1 << 1)  // Same logic as above ^
-#define RESERVED_BITS 2          // For been_freed and prev_free flags
+
+#define MAX_ALLOC ~(size_t)3 - sizeof(size_t) // Reserved space for two reserved bits and the header
+#define MIN_SIZE  32                          // Mimimum MIN_SIZE for storing the linked list node + header + footer data when freed
+#define PAGE_SIZE 4096                        // 4KiB Hard coded
+#define MIN_ALLOC PAGE_SIZE * 16              // 64KiB
+#define PAYLOAD_ALIGN 16                      // 16 byte payload alignment
+#define NUM_BUCKETS 11                        // from 32B to 32KiB+, each bucket doubling
+#define BEEN_FREED_MASK 1                     // AND for read, OR to write 1, INVERT mask + AND to write 0
+#define PREV_FREE_MASK (1 << 1)               // Same logic as above ^
+#define RESERVED_BITS 2                       // For been_freed and prev_free flags
 
 #define ALIGN_UP(size, align) (((size) + (align) - 1) & ~((align) - 1))
 
@@ -66,7 +65,7 @@ static inline int get_bucket_index(size_t size) {
   return index;
 }
 
-static inline void* get_free_chunk_from_seglist(size_t size) {
+static inline void* get_free_from_seglist(size_t size) {
   int index = get_bucket_index(size);
 
   for (size_t i = index; i < NUM_BUCKETS; ++i) {
@@ -99,12 +98,12 @@ static inline void* mark_sentinel(size_t* ptr, size_t size) {
     void* ptr = VirtualAlloc(
       NULL,          // Let the OS decide the address
       size,          // Size to expand
-      MEM_COMMIT,    // Both reserve and use the memory
+      MEM_RESERVE | MEM_COMMIT, // Both reserve and use the memory
       PAGE_READWRITE // Read-write permission
     );
 
-    assert(ptr != MAP_FAILED);
-    if (ptr == MAP_FAILED) return NULL;
+    assert(ptr != NULL);
+    if (ptr == NULL) return NULL;
     return mark_sentinel(ptr, size);
   }
 #else 
@@ -123,20 +122,28 @@ static inline void* mark_sentinel(size_t* ptr, size_t size) {
   }
 #endif
 
-static inline void* prepare_remaining_chunk(size_t* ptr, size_t size) {
+static inline void prepare_and_put_remaining_chunk_in_seglist(size_t* ptr, size_t size) {
   size_t header = size << RESERVED_BITS; // prev_free off by default
   header |= BEEN_FREED_MASK; // on
   ptr[0] = header;
   memcpy((char*)ptr + size - sizeof(size_t), &size, sizeof(size_t)); // footer at the end
   assert((size_t)(ptr + 1) % PAYLOAD_ALIGN == 0); // Paylad should be 16 byte aligned
-  return ptr + 1;
+  
+  // Put the free chunk into seglist
+  int index = get_bucket_index(size);
+  list_insert(&seglist[index], (FreeNode*)(ptr + 1));
 }
 
-static inline void* prepare_primary_chunk(size_t* ptr, size_t size) {
-  size_t header = size << RESERVED_BITS; // It's not free, and prev_free is set at allocation
-  ptr[0] = header;
-  assert((size_t)(ptr + 1) % PAYLOAD_ALIGN == 0);
-  return ptr + 1;
+static inline void* prepare_primary_chunk(size_t* header_ptr, size_t size) {
+  size_t header = size << RESERVED_BITS; // It's not free, and logically can't have prev_free flag on
+  header_ptr[0] = header;
+  assert((size_t)(header_ptr + 1) % PAYLOAD_ALIGN == 0);
+
+  // Mark prev free flag of next header
+  size_t* next_header = (size_t*)((char*)header_ptr + size);
+  *next_header &= ~PREV_FREE_MASK;
+
+  return header_ptr + 1;
 }
 
 static inline bool chunk_is_free(size_t* chunk) {
@@ -159,50 +166,45 @@ static inline bool chunk_is_free(size_t* chunk) {
 #endif
 
 void* ulalloc(size_t size) {
-  if (!size || size > MAX_SIZE) return NULL; 
+  if (!size || size > MAX_ALLOC) return NULL; 
 
   // Calculate extra bytes for storing (size_t) header in the allocated memory. 
   size += sizeof(size_t); 
   size = size < MIN_SIZE ? MIN_SIZE : size; // To contain all the metadata when freed, a chunk at minimum needs to be MIN_SIZE
+  size = ALIGN_UP(size, PAYLOAD_ALIGN);
   size_t chunk_size = size;
 
   // Look for memory inside the seglist first. 
-  size_t* header_ptr = get_free_chunk_from_seglist(size); // returns pointer to header if available else NULL
+  size_t* header_ptr = get_free_from_seglist(size); // returns pointer to header if available else NULL
 
   // If not found in seglist, beg the OS for more memory
   if (header_ptr == NULL) {
-    chunk_size += sizeof(size_t) * 2;    // extra sizeof(size_t) * 2 bytes for the sentinels
+    chunk_size += sizeof(size_t) * 2;     // extra sizeof(size_t) * 2 bytes for the sentinels
     chunk_size = chunk_size <= MIN_ALLOC ? MIN_ALLOC : ALIGN_UP(chunk_size, PAGE_SIZE); // Make sure the req_size is a multiple of 4KiB 
     header_ptr = expand_heap(chunk_size); // expadn_heap already offsets the header_ptr past the prologue (left sentinel)
+
     if (header_ptr == NULL) return NULL;  // Neither the seglist nor the os has enough memory to lend; return NULL
     assert((size_t)header_ptr % 8 == 0 && (size_t)header_ptr % PAYLOAD_ALIGN != 0); // header location should not be a multiple of PAYLOAD_ALIGN
-    chunk_size -= sizeof(size_t) * 2;    // Remove the extra bytes taken up by the sentinels from the usuable chunk
+    chunk_size -= sizeof(size_t) * 2;     // Remove the extra bytes taken up by the sentinels from the usuable chunk
   } else { // Extract the size from the header
     chunk_size = (*header_ptr) >> RESERVED_BITS;
   }
 
   // Take up the necessary padding spaces and keep the extra bytes if they are less than MIN_SIZE
-  size_t req_size = ALIGN_UP(size, PAYLOAD_ALIGN);
-  size_t remaining = chunk_size - req_size; // remaining bytes. Should never be < 0
+  size_t remaining = chunk_size - size; // remaining bytes. Should logically never be < 0
   if (remaining >= MIN_SIZE && chunk_size <= MIN_ALLOC) {
-    int index = get_bucket_index(remaining);
-    size_t* remaining_header_ptr = (size_t*)((char*)header_ptr + req_size);
-    void* remaining_chunk = prepare_remaining_chunk(remaining_header_ptr, remaining);
-    assert((size_t)header_ptr % 8 == 0 && (size_t)header_ptr % PAYLOAD_ALIGN != 0); 
-    list_insert(&seglist[index], remaining_chunk);
-  } else {
-    req_size += remaining;
-    assert(req_size == chunk_size);
+    void* remaining_header_ptr = (char*)header_ptr + size;
+    prepare_and_put_remaining_chunk_in_seglist(remaining_header_ptr, remaining);
+    chunk_size -= remaining;
   }
-  
-  return prepare_primary_chunk(header_ptr, req_size);
-}
 
+  return prepare_primary_chunk(header_ptr, chunk_size);
+}
 
 void ulfree(void* ptr) {
   if (chunk_is_free(ptr)) {
     fprintf(stderr, "Fatal Error: Attempted double free!\n");
-    exit(EXIT_FAILURE); // Exits cleanly with failure code
+    exit(EXIT_FAILURE);
   }
   size_t* header_ptr = (size_t*)ptr - 1;
   size_t header = *header_ptr;
@@ -257,3 +259,67 @@ void ulfree(void* ptr) {
   *new_next_header_ptr |= PREV_FREE_MASK;
 } 
 
+void* realloc(void* ptr, size_t size) {
+  if (!size || size > MAX_ALLOC) return NULL; 
+
+  size_t og_size = size;
+  size += sizeof(size_t); 
+  size = size < MIN_SIZE ? MIN_SIZE : size; 
+  size = ALIGN_UP(size, PAYLOAD_ALIGN);
+
+  // Extract current chunk data
+  size_t* curr_header_ptr = (size_t*)ptr - 1;
+  size_t curr_header = *curr_header_ptr;
+  size_t curr_size = curr_header >> RESERVED_BITS;
+
+  // New chunk size and ptr if merging is possible
+  size_t* new_header_ptr = curr_header_ptr;
+  size_t merged_size = curr_size;
+  size_t* next_header_ptr = (size_t*)((char*)curr_header_ptr + curr_size);
+  size_t next_header = *next_header_ptr;
+  size_t* prev_header_ptr = NULL;
+
+  if (next_header & BEEN_FREED_MASK) {
+    merged_size += next_header >> RESERVED_BITS;
+  } else {
+    next_header_ptr = NULL;
+  }
+
+  if (curr_header & PREV_FREE_MASK) {
+    size_t prev_size = *(curr_header_ptr - 1);
+    prev_header_ptr = (size_t*)((char*)curr_header_ptr - prev_size);
+    new_header_ptr = prev_header_ptr;
+    merged_size += (*prev_header_ptr) >> RESERVED_BITS;
+  }
+
+  // If the merged size is still not enough, return a new chunk
+  if (merged_size < size) {
+    void* new_ptr = ulalloc(og_size);
+    memcpy(new_ptr, ptr, curr_size);
+    ulfree(ptr);
+    return new_ptr;
+  } 
+
+  // Rmeove the neighbours from the seglist
+  if (prev_header_ptr) {
+    list_remove((FreeNode*)(prev_header_ptr + 1));
+  }
+  if (next_header_ptr) {
+    list_remove((FreeNode*)(next_header_ptr + 1));
+  }
+
+  // Put extra bytes in the seglist if available
+  size_t remaining = merged_size - size;
+  if (remaining >= MIN_SIZE) {
+    new_header_ptr = (size_t*)((char*)new_header_ptr + remaining);
+    void* remaining_header_ptr = (char*)new_header_ptr + size;
+    prepare_and_put_remaining_chunk_in_seglist(remaining_header_ptr, remaining);
+    merged_size -= remaining;
+  } 
+
+  // Copy over the data from previous place
+  size_t copy_size = (curr_size > merged_size ? merged_size : curr_size) - sizeof(size_t);
+  memmove(new_header_ptr, curr_header_ptr, copy_size);
+
+  return prepare_primary_chunk(new_header_ptr, merged_size);
+} 

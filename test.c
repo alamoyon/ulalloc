@@ -5,6 +5,9 @@
 #include <stdint.h>
 #include <string.h>
 
+//////////////////
+/// Test Utils ///
+//////////////////
 #define STR_LEN 64
 static bool assert_has_failed = false;
 
@@ -47,16 +50,22 @@ static char req_str[STR_LEN];
 ), var_name                                                                 \
 
 #define ASSERT(exp, op, req)                                                \
-  if (exp op req) return;                                                   \
-  if (!assert_has_failed) {                                                 \
-    printf("\033[33m(Failed)\033[0m\n");                                    \
-    assert_has_failed = true;                                               \
-  }                                                                         \
-  TO_STR(exp, exp_str);                                                     \
-  TO_STR(req, req_str);                                                     \
-  PRINT_COMP_TEXT(op);                                                      \
+  do {                                                                      \
+    if (!((exp) op (req))) {                                                \
+      if (!assert_has_failed) {                                             \
+        printf("\033[33m(Failed)\033[0m\n");                                \
+        assert_has_failed = true;                                           \
+      }                                                                     \
+      TO_STR(exp, exp_str);                                                 \
+      TO_STR(req, req_str);                                                 \
+      PRINT_COMP_TEXT(op);                                                  \
+    }                                                                       \
+  } while (0)
 
 
+//////////////////////
+/// Internal Utils ///
+//////////////////////
 typedef struct {
   size_t size;
   bool been_freed;
@@ -72,16 +81,42 @@ Header extract_header(void* ptr) {
   };
 }
 
+static inline void inspect_seglist() {
+  for (size_t i = 0; i < NUM_BUCKETS; ++i) {
+    FreeNode* sentinel = &seglist[i];
+    FreeNode* next_free_node = sentinel->next;
+    if (sentinel != next_free_node) {
+      printf("Bucket: %zu, %zu Bytes\n", i + 1, (size_t)32 << i);
+    }
+
+    for (FreeNode* curr = sentinel->next; curr != sentinel; curr = curr->next) {
+      size_t header = *(size_t*)((char*)curr - sizeof(size_t));
+      int is_free   = header &  BEEN_FREED_MASK ? 1 : 0;
+      int prev_free = header &  PREV_FREE_MASK ? 1 : 0;
+      size_t size   = header >> RESERVED_BITS;
+      printf("(%zu) Is free: %d, Prev free: %d, Size: %zu\n", (size_t)curr, is_free, prev_free, size);
+    }
+
+    if (sentinel != next_free_node) {
+      printf("\n");
+    }
+  }
+  printf("--------------------------------------------------------\n");
+}
+
+//////////////////////
+/// Test functions ///
+//////////////////////
 void t_basic_allocation_and_writing() {
   int chunk_size = 5;
-  int* chunk = ulalloc(chunk_size);
+  int* chunk = ulalloc(chunk_size * sizeof(int));
 
   for (int i = 0; i < chunk_size; ++i) {
     chunk[i] = i * i;
   }
 
   for (int i = 0; i < chunk_size; ++i) {
-    ASSERT(chunk[i], ==, i * i);
+    ASSERT(i * i, ==, chunk[i]);
   }
 
   ulfree(chunk);
@@ -91,27 +126,52 @@ void t_minimum_chunk_size_header_data() {
   int* chunk = ulalloc(10);
   Header header = extract_header(chunk);
 
-  ASSERT(header.size, ==, MIN_SIZE);
-  ASSERT(header.been_freed, ==, false);
+  ASSERT(MIN_SIZE, ==, header.size);
+  ASSERT(false, ==, header.been_freed);
 
   ulfree(chunk);
 }
 
-void t_allocates_extra_bytes_for_the_header() {
+void t_extra_bytes_for_the_header_and_padding() {
   int* chunk = ulalloc(MIN_SIZE);
   Header header = extract_header(chunk);
   size_t expected_size = ALIGN_UP(MIN_SIZE + sizeof(size_t), PAYLOAD_ALIGN);
 
-  ASSERT(header.size, ==, expected_size);
+  ASSERT(expected_size, ==, header.size);
 
   ulfree(chunk);
 }
 
+void t_check_sentinel_values() {
+  size_t chunk_size = 10;
+  size_t* chunk = ulalloc(chunk_size * sizeof(size_t));
+  
+  size_t prologue = *(chunk - 2);
+  ASSERT(0, ==, prologue);
+
+  size_t epilogue = *(size_t*)((char*)chunk + (MIN_ALLOC - sizeof(size_t) * 3));
+  ASSERT(0 | PREV_FREE_MASK, ==, epilogue);
+  
+  ulfree(chunk);
+}
+
+void t_allocate_larger_than_min_alloc() {
+  size_t chunk_size = MIN_ALLOC + 10;
+  char* chunk = ulalloc(chunk_size);
+  Header header = extract_header(chunk);
+
+  size_t expected_chunk_size = ALIGN_UP(chunk_size + sizeof(size_t), PAYLOAD_ALIGN);
+  expected_chunk_size = ALIGN_UP(expected_chunk_size, PAGE_SIZE) - sizeof(size_t) * 2;
+  ASSERT(expected_chunk_size, ==, header.size);
+
+  ulfree(chunk);
+}
 
 int main() {
   CALL_TEST(t_basic_allocation_and_writing);
   CALL_TEST(t_minimum_chunk_size_header_data);
-  CALL_TEST(t_allocates_extra_bytes_for_the_header);
-
+  CALL_TEST(t_extra_bytes_for_the_header_and_padding);
+  CALL_TEST(t_check_sentinel_values);
+  CALL_TEST(t_allocate_larger_than_min_alloc);
   return 0;
 }

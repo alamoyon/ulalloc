@@ -259,7 +259,7 @@ void ulfree(void* ptr) {
   *new_next_header_ptr |= PREV_FREE_MASK;
 } 
 
-void* realloc(void* ptr, size_t size) {
+void* ulrealloc(void* ptr, size_t size) {
   if (!size || size > MAX_ALLOC) return NULL; 
 
   size_t og_size = size;
@@ -311,7 +311,6 @@ void* realloc(void* ptr, size_t size) {
   // Put extra bytes in the seglist if available
   size_t remaining = merged_size - size;
   if (remaining >= MIN_SIZE) {
-    new_header_ptr = (size_t*)((char*)new_header_ptr + remaining);
     void* remaining_header_ptr = (char*)new_header_ptr + size;
     prepare_and_put_remaining_chunk_in_seglist(remaining_header_ptr, remaining);
     merged_size -= remaining;

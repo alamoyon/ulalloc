@@ -37,22 +37,20 @@
 //////////////////
 /// Test Utils ///
 //////////////////
-#define STR_LEN 64
-#define NO_PARAMS void* _, void* __
+#define STR_LEN 128 
 static char exp_str[STR_LEN];
 static char ret_str[STR_LEN];
 
 static bool assert_has_failed = false;
 
-// Arguments for CALL_TEST
-enum ArgOptions { 
-  NONE,
-  BYTES_8,     // 8 bytes
-  BYTES_40,    // MIN_SIZE + sizeof(size_t)
-  BYTES_8_40,  // 8 and 40 bytes
-};
 static void* bytes_8  = NULL;
 static void* bytes_40 = NULL;
+
+// Arguments 
+#define NONE
+#define BYTES_8 bytes_8
+#define BYTES_40 bytes_40
+#define BYTES_8_40 bytes_8, bytes_40
 
 static double time_ms;
 static double get_time_ms() {
@@ -65,28 +63,42 @@ static double get_time_ms() {
 #define MAKE_FAIL_LOG(comp) " ╰─ Expected \033[32m(%s)\033[0m %s recieved \033[33m(%s)\033[0m\n", exp_str, comp, ret_str
 
 // Convert expected and returned value to strings
+static int str_bool  (char *d, bool x)         { return snprintf(d, STR_LEN, "%s",  x ? "true" : "false"); }
+static int str_int   (char *d, int x)          { return snprintf(d, STR_LEN, "%d",  x); }
+static int str_uint  (char *d, unsigned x)     { return snprintf(d, STR_LEN, "%u",  x); }
+static int str_long  (char *d, long x)         { return snprintf(d, STR_LEN, "%ld", x); }
+static int str_ulong (char *d, unsigned long x){ return snprintf(d, STR_LEN, "%lu", x); }
+static int str_double(char *d, double x)       { return snprintf(d, STR_LEN, "%f",  x); }
+static int str_cstr  (char *d, const char *x)  { return snprintf(d, STR_LEN, "%s",  x ? x : "(null)"); }
+static int str_ptr   (char *d, const void *x)  { return snprintf(d, STR_LEN, "%p",  x); }
 #define TO_STR(x, var_name) _Generic((x),                                   \
-  bool: snprintf(var_name, STR_LEN, "%s", (bool)(x) ? "true" : "false"),    \
-  int: snprintf(var_name, STR_LEN, "%d", (int)(x)),                         \
-  unsigned long: snprintf(var_name, STR_LEN, "%lu", (unsigned long)(x)),    \
-  default:       snprintf(var_name, STR_LEN, "%s",                          \
-  (const char*)(uintptr_t)(x) ? (const char*)(uintptr_t)(x) : "(null)")     \
-), var_name                                                                 \
+  bool:          str_bool,                                                  \
+  int:           str_int,                                                   \
+  unsigned:      str_uint,                                                  \
+  long:          str_long,                                                  \
+  unsigned long: str_ulong,                                                 \
+  double:        str_double,                                                \
+  float:         str_double,                                                \
+  char*:         str_cstr,                                                  \
+  const char*:   str_cstr,                                                  \
+  default:       str_ptr                                                    \
+) (var_name, (x))
+
 
 // Print fail log
 #define PRINT_FAIL_LOG(log, op) do {                                        \
   printf(" ╭ %s\n", log);                                                   \
-  if (strcmp(#op, ">") == 0) {                                              \
+  if (strcmp(op, ">") == 0) {                                               \
     printf(MAKE_FAIL_LOG("is not greater than"));                           \
-  } else if (strcmp(#op, "<") == 0) {                                       \
+  } else if (strcmp(op, "<") == 0) {                                        \
     printf(MAKE_FAIL_LOG("is not less than"));                              \
-  } else if (strcmp(#op, "<=") == 0) {                                      \
+  } else if (strcmp(op, "<=") == 0) {                                       \
     printf(MAKE_FAIL_LOG("is not less than or equal to"));                  \
-  } else if (strcmp(#op, ">=") == 0) {                                      \
+  } else if (strcmp(op, ">=") == 0) {                                       \
     printf(MAKE_FAIL_LOG("is not greater than or equal to"));               \
-  } else if (strcmp(#op, "==") == 0) {                                      \
+  } else if (strcmp(op, "==") == 0) {                                       \
     printf(MAKE_FAIL_LOG("is not equal to"));                               \
-  } else if (strcmp(#op, "!=") == 0) {                                      \
+  } else if (strcmp(op, "!=") == 0) {                                       \
     printf(MAKE_FAIL_LOG("is equal to"));                                   \
   }                                                                         \
 } while (0);                                                                \
@@ -100,17 +112,17 @@ static double get_time_ms() {
     }                                                                       \
     TO_STR(exp, exp_str);                                                   \
     TO_STR(ret, ret_str);                                                   \
-    PRINT_FAIL_LOG(log, op);                                                \
+    PRINT_FAIL_LOG(log, #op);                                               \
   }                                                                         \
 } while (0)                                                                 \
 
 // Initizalize arguments
 #define INIT_ARGS(opt) do {                                                 \
-  if (opt == BYTES_8) {                                                     \
+  if (strcmp(opt, "BYTES_8") == 0) {                                        \
     bytes_8 = ulalloc(8);                                                   \
-  } else if (opt == BYTES_40) {                                             \
+  } else if (strcmp(opt, "BYTES_40") == 0) {                                \
     bytes_40 = ulalloc(40);                                                 \
-  } else if (opt == BYTES_8_40) {                                           \
+  } else if (strcmp(opt, "BYTES_8_40") == 0) {                              \
     bytes_8 = ulalloc(8);                                                   \
     bytes_40 = ulalloc(40);                                                 \
   }                                                                         \
@@ -131,8 +143,8 @@ static double get_time_ms() {
 // Test the passsed functions
 #define TEST(func, arg) do {                                                \
   printf("%s ", #func);                                                     \
-  INIT_ARGS(arg);                                                           \
-  func(bytes_8, bytes_40);                                                  \
+  INIT_ARGS(#arg);                                                          \
+  func(arg);                                                                \
   FREE_ARGS();                                                              \
   if (!assert_has_failed) printf("\033[32m(Passed)\033[0m\n");              \
   assert_has_failed = false;                                                \
@@ -200,9 +212,10 @@ static inline int extract_free_payloads_from_seglist(int index, size_t** buff, i
   return counter;
 }
 
-void test(NO_PARAMS) {
+void test() {
   ASSERT(true, ==, true, "True is indeed, true");
   ASSERT(false, ==, true, "OMG! False is not, true");
+  ASSERT(1, ==, 2.3, "Oh no! 1 is not, 2.3");
 }
 
 int main() {

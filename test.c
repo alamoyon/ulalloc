@@ -10,30 +10,14 @@
 #include <string.h>
 #include <time.h>
 
-
-// Data survives ulrealloc. Write a pattern, realloc, and verify every byte.
-// ✅️ Coalescing in isolation. Right-only merge, left-only merge, and reverse-order frees 
-// ✅️ Bucket placement. ul_get_bucket_index has boundary cases (32, 33, 64, 65, and everything at or above 32KiB clamping to the last bucket)
-// Realloc paths. Shrinking (which should split off a remainder), 
-// Growing by merging with the left neighbor, growing by merging withj both neighbors, and realloc to the same size.
-// Edge inputs:
-  // ✅️ ulalloc(0) and ulalloc(SIZE_MAX) should return NULL.
-  // ulfree(NULL) and ulrealloc(NULL, n) look like they'd crash, because chunk_is_free and ulrealloc dereference ptr - 1 unconditionally. Decide whether you want malloc semantics and test for it.
-  // ulrealloc(ptr, 0) returns NULL without freeing ptr, which leaks. Standard realloc behavior differs, so decide what you want here too.
-// Alignment. Every returned pointer should satisfy (uintptr_t)ptr % PAYLOAD_ALIGN == 0. Cheap to add and worth checking in every test.
-// Data survives ulrealloc. Write a pattern, realloc, and verify every byte. This is the one that would catch the two bugs I mentioned earlier, and it's the most important missing test.
-// ✅️ Coalescing in isolation. Right-only merge, left-only merge, and reverse-order frees (chunk3, chunk2, chunk1) each hit different branches in ulfree. Your current test only exercises both merges at once.
-// ✅️ Reuse from the ulseglist. Alloc, free, then alloc the same size and check you get the same block back. This exercises get_free_from_seglist, which currently only runs when the fresh arena's leftover gets consumed.
-// Realloc paths. Shrinking (which should split off a remainder), growing by merging with the left neighbor, growing by merging with both neighbors, and realloc to the same size.
-// Double free. It calls exit, so testing it means fork()-ing and checking the child's exit status.
-
-
-
-
 //////////////////
 /// Test Utils ///
 //////////////////
 #define STR_LEN 128 
+
+int total_tests = 0;
+int total_passed = 0;
+
 static char exp_str[STR_LEN];
 static char ret_str[STR_LEN];
 
@@ -49,11 +33,10 @@ static void* g_bytes_40 = NULL;
 #define BYTES_8_40 g_bytes_8, g_bytes_40
 
 // Get time 
-static double time_ms;
-static double get_time_ms() {
+static size_t get_time_micros() {
   struct timespec ts;
   timespec_get(&ts, TIME_UTC);
-  return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+  return (size_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;;
 }
 
 // Create fail log for printing
@@ -145,13 +128,19 @@ static int str_ptr   (char *d, const void *x)  { return snprintf(d, STR_LEN, "%p
 
 // Test the passsed functions
 #define TEST(func, arg) do {                                                \
+  total_tests++;                                                            \
   printf("%s ", #func);                                                     \
   INIT_ARGS(#arg);                                                          \
+  size_t time_micros = get_time_micros();                                   \
   func(arg);                                                                \
+  time_micros = get_time_micros() - time_micros;                            \
   FREE_ARGS();                                                              \
-  if (!assert_has_failed) printf("\033[32m(Passed)\033[0m\n");              \
+  if (!assert_has_failed) {                                                 \
+    printf("\033[32m(Passed in %zuμs)\033[0m\n", time_micros);              \
+    total_passed++;                                                         \
+  }                                                                         \
   assert_has_failed = false;                                                \
-  RESET_TEST_GLOBALS()                                                      \
+  RESET_TEST_GLOBALS();                                                     \
 } while (0)                                                                 \
 
 //////////////////////
@@ -217,17 +206,22 @@ void safe_ulfree(void* ptr) {
   if (ptr == NULL) {
     return;
   } else if (ptr == g_bytes_8) {
-    ulfree(g_bytes_8);
+    ulfree_impl(g_bytes_8);
     g_bytes_8 = NULL;
   } else if (ptr == g_bytes_40) {
-    ulfree(g_bytes_40);
+    ulfree_impl(g_bytes_40);
     g_bytes_40 = NULL;
   } else {
-    ulfree(ptr);
+    ulfree_impl(ptr);
     ptr = NULL;
   }
 }
 
+int print_result() {
+  printf("--------------------------------------------------------------------------------\n");
+  printf("(%d/%d) tests passed!\n", total_passed, total_tests);
+  return total_tests == total_passed ? 0 : 1;
+}
 
 //////////////////////
 /// Test functions ///
@@ -269,12 +263,12 @@ void test_alloc_edge_cases() {
   ASSERT(NULL, ==, ulalloc(UL_MAX_ALLOC + 1), "Asking for bytes greater than UL_MAX_ALLOC doesn't return NULL");
   ASSERT(0, ==, get_total_free_chunk_num(), "ulseglist is not empty");
 }
-void test_payload_align_on_alloc(char* bytes_8) {
+void test_payload_alignment_on_alloc(char* bytes_8) {
   ASSERT(0, ==, (size_t)bytes_8 % UL_PAYLOAD_ALIGN, "Payload doesn't align");
 }
 void test_alloc_and_write(char* bytes_8) {
-  char* str = "12345678";
-  memcpy(bytes_8, str, 8);
+  char* str = "1234567";
+  memcpy(bytes_8, str, strlen(str));
   ASSERT(0, ==, memcmp(str, bytes_8, 8), "Write failed!");
 }
 void test_prev_free_flag_after_prev_chunk_has_been_allocd_again(char* bytes_8, size_t* bytes_40) {
@@ -301,17 +295,20 @@ void test_remaining_free_chunk(char* bytes_8) {
   extract_free_payloads_from_seglist(LAST_BUCKET, &remaining_chunk, 1);
   Header remaining_chunk_header = extract_header(remaining_chunk);
   size_t remaining_chunk_exp_size = ARENA_SIZE - BYTES_8_EXP_SIZE;
-  ASSERT(false, ==, remaining_chunk_header.prev_free, "'prev_free' chunk is set true for remaining chunk");
-  ASSERT(true, ==, remaining_chunk_header.been_freed, "'been_freed' chunk is set false for remaining chunk");
+  ASSERT(false, ==, remaining_chunk_header.prev_free, "'prev_free' flag is set true for remaining chunk");
+  ASSERT(true, ==, remaining_chunk_header.been_freed, "'been_freed' flag is set false for remaining chunk");
   ASSERT(remaining_chunk_exp_size, ==, remaining_chunk_header.size, "Expected size doesn't match for remaining chunk");
 }
 
 // Free tests
 void test_free_edge_cases(char* bytes_8, size_t* bytes_40) {
+  ulfree(NULL);
+  ASSERT(true, ==, ul_g_test_noop, "Passing NULL to ulfree wasn't NOOP");
   char* saved_bytes_8_ptr = bytes_8;
   safe_ulfree(bytes_8);
   ulfree(saved_bytes_8_ptr); // double free
   ASSERT(true, ==, ul_g_test_crashed, "No runtime crashes");
+  return;
 }
 void test_prev_free_flag_after_prev_chunk_has_been_freed(char* bytes_8, size_t* bytes_40) {
   safe_ulfree(bytes_8);
@@ -327,8 +324,8 @@ void test_left_merge_header_values(char* bytes_8, size_t* bytes_40) {
   int bucket_index = ul_get_bucket_index(remaining_chunk_exp_size);
   extract_free_payloads_from_seglist(bucket_index, &remaining_chunk, 1);
   Header remaining_chunk_header = extract_header(remaining_chunk);
-  ASSERT(false, ==, remaining_chunk_header.prev_free, "'prev_free' chunk is set true for remaining chunk");
-  ASSERT(true, ==, remaining_chunk_header.been_freed, "'been_freed' chunk is set false for remaining chunk");
+  ASSERT(false, ==, remaining_chunk_header.prev_free, "'prev_free' flag is set true for remaining chunk");
+  ASSERT(true, ==, remaining_chunk_header.been_freed, "'been_freed' flag is set false for remaining chunk");
   ASSERT(remaining_chunk_exp_size, ==, remaining_chunk_header.size, "Expected size doesn't match for remaining chunk");
   safe_ulfree(righmost_chunk);
 }
@@ -338,8 +335,8 @@ void test_right_merge_header_values(char* bytes_8, size_t* bytes_40) {
   extract_free_payloads_from_seglist(LAST_BUCKET, &remaining_chunk, 1);
   size_t remaining_chunk_exp_size = ARENA_SIZE - BYTES_8_EXP_SIZE;
   Header remaining_chunk_header = extract_header(remaining_chunk);
-  ASSERT(false, ==, remaining_chunk_header.prev_free, "'prev_free' chunk is set true for remaining chunk");
-  ASSERT(true, ==, remaining_chunk_header.been_freed, "'been_freed' chunk is set false for remaining chunk");
+  ASSERT(false, ==, remaining_chunk_header.prev_free, "'prev_free' flag is set true for remaining chunk");
+  ASSERT(true, ==, remaining_chunk_header.been_freed, "'been_freed' flag is set false for remaining chunk");
   ASSERT(remaining_chunk_exp_size, ==, remaining_chunk_header.size, "Expected size doesn't match for remaining chunk");
 }
 void test_left_and_right_merge_header_value(char* bytes_8, size_t* bytes_40) {
@@ -356,8 +353,8 @@ void test_left_and_right_merge_header_value(char* bytes_8, size_t* bytes_40) {
   int bucket_index = ul_get_bucket_index(remaining_chunk_exp_size);
   extract_free_payloads_from_seglist(bucket_index, &remaining_chunk, 1);
   Header remaining_chunk_header = extract_header(remaining_chunk);
-  ASSERT(false, ==, remaining_chunk_header.prev_free, "'prev_free' chunk is set true for remaining chunk");
-  ASSERT(true, ==, remaining_chunk_header.been_freed, "'been_freed' chunk is set false for remaining chunk");
+  ASSERT(false, ==, remaining_chunk_header.prev_free, "'prev_free' flag is set true for remaining chunk");
+  ASSERT(true, ==, remaining_chunk_header.been_freed, "'been_freed' flag is set false for remaining chunk");
   ASSERT(remaining_chunk_exp_size, ==, remaining_chunk_header.size, "Expected size doesn't match for remaining chunk");
   safe_ulfree(righmost_chunk);
 }
@@ -370,6 +367,19 @@ void test_reuse_from_seglist_after_free(char* bytes_8, size_t* bytes_40) {
 }
 
 // Realloc tests
+void test_header_after_realloc(char* bytes_8) {
+  char* realloced_chunk = ulrealloc(bytes_8, 40);
+  Header realloced_chunk_header = extract_header(realloced_chunk);
+  ASSERT(false, ==, realloced_chunk_header.prev_free, "'prev_free' flag is set true for realloced chunk");
+  ASSERT(false, ==, realloced_chunk_header.been_freed, "'been_freed' flag is set true for realloced chunk");
+  ASSERT(BYTES_40_EXP_SIZE, ==, realloced_chunk_header.size, "Expected size doesn't match for realloced chunk");
+
+  realloced_chunk = ulrealloc(bytes_8, 8);
+  realloced_chunk_header = extract_header(realloced_chunk);
+  ASSERT(false, ==, realloced_chunk_header.prev_free, "'prev_free' flag is set true for realloced chunk");
+  ASSERT(false, ==, realloced_chunk_header.been_freed, "'been_freed' flag is set true for realloced chunk");
+  ASSERT(BYTES_8_EXP_SIZE, ==, realloced_chunk_header.size, "Expected size doesn't match for realloced chunk");
+}
 void test_realloc_edge_cases(void* bytes_8, void* bytes_40) {
   // Pass 0 as the new size
   ASSERT(NULL, ==, ulrealloc(bytes_8, 0), "Asking for 0 bytes doesn't return NULL");
@@ -381,20 +391,31 @@ void test_realloc_edge_cases(void* bytes_8, void* bytes_40) {
   // Pass NULL as the ptr
   bytes_8 = ulrealloc(NULL, 8);
   ASSERT(BYTES_8_EXP_SIZE, ==, extract_header(bytes_8).size, "Passing NULL did not allocate BYTES_8_EXP_SIZE chunk");
-  // TODO: Add test for passing freed chunk
-
+  
+  // Pass freed chunk (Double-free error)
   safe_ulfree(bytes_8);
+  safe_ulfree(bytes_8);
+  ASSERT(true, ==, ul_g_test_crashed, "Test did not crash");
 }
-void test_realloc_data_persistence(char* bytes_8) {
-  char* str = "12345678";
-  memcpy(bytes_8, str, 8);
+void test_payload_alignment_on_realloc(char* bytes_8) {
+  char* realloced_chunk = ulrealloc(bytes_8, 40);
+  ASSERT(0, ==, (size_t)realloced_chunk % UL_PAYLOAD_ALIGN, "Payload doesn't align");
+}
+void test_realloc_data_persistence_on_expanding(char* bytes_8) {
+  char* str = "1234567";
+  memcpy(bytes_8, str, strlen(str));
   ASSERT(0, ==, memcmp(str, bytes_8, 8), "Data doesn't match");
   char* realloced_chunk = ulrealloc(bytes_8, 40);
   ASSERT(0, ==, memcmp(str, realloced_chunk, 8), "Data doesn't match after realloc");
   safe_ulfree(realloced_chunk);
 }
-// TODO: What happens when bytes_8 is internally freed without g_bytes_8 being set to NULL
-// Ansewer: I could add special macros for testing specifically
+void test_realloc_data_persistence_on_shrinking(char* bytes_40) {
+  char* large_str = "123456789ABCDEF";
+  char* str = "12345678";
+  memcpy(bytes_40, large_str, strlen(large_str));
+  char* realloced_chunk = ulrealloc(bytes_40, 8);
+  ASSERT(0, ==, memcmp(str, realloced_chunk, 8), "Data changed after shrinking");
+}
 void test_realloc_merging_neigbours(char* bytes_8, size_t* bytes_40) {
   void* righmost_chunk = ulalloc(sizeof(size_t)); // Blocks to-be freed bytes_40 merging with remaining chunk
   safe_ulfree(bytes_40);
@@ -416,6 +437,32 @@ void test_realloc_merging_neigbours(char* bytes_8, size_t* bytes_40) {
   safe_ulfree(righmost_chunk);
   safe_ulfree(realloced_chunk);
 }
+void test_realloc_remaining_free_chunk(char* bytes_8) {
+  bytes_8 = ulrealloc(bytes_8, 40);
+  size_t* remaining_chunk;
+  size_t remaining_chunk_exp_size = ARENA_SIZE - BYTES_40_EXP_SIZE;
+  extract_free_payloads_from_seglist(LAST_BUCKET, &remaining_chunk, 1);
+  Header remaining_chunk_header = extract_header(remaining_chunk);
+  ASSERT(false, ==, remaining_chunk_header.prev_free, "'prev_free' flag is set true for remaining chunk");
+  ASSERT(true, ==, remaining_chunk_header.been_freed, "'been_freed' flag is set false for remaining chunk");
+  ASSERT(remaining_chunk_exp_size, ==, remaining_chunk_header.size, "Expected size doesn't match for remaining chunk");
+}
+void test_realloc_splitting_off_a_remainder(char* bytes_8, size_t* bytes_40) {
+  void* righmost_chunk = ulalloc(8);
+  safe_ulfree(bytes_40); // BYTES_40_EXP_SIZE has been freed to the right of bytes_8
+  char* realloced_chunk = ulrealloc(bytes_8, BYTES_8_EXP_SIZE + 40);
+  ASSERT(1, ==, get_total_free_chunk_num(), "Seglist doesn't contain 1 free chunk");
+  realloced_chunk = ulrealloc(bytes_8, 8);
+  ASSERT(2, ==, get_total_free_chunk_num(), "Seglist doesn't contain 2 free chunk");
+  
+  size_t* freed_chunk;
+  int bucket_index = ul_get_bucket_index(BYTES_40_EXP_SIZE);
+  extract_free_payloads_from_seglist(bucket_index, &freed_chunk, 1);
+  Header freed_chunk_header = extract_header(freed_chunk);
+  ASSERT(false, ==, freed_chunk_header.prev_free, "'prev_free' flag is set true for freed chunk");
+  ASSERT(true, ==, freed_chunk_header.been_freed, "'been_freed' flag is set false for freed chunk");
+  ASSERT(BYTES_40_EXP_SIZE, ==, freed_chunk_header.size, "Expected size doesn't match for freed chunk");
+}
 
 int main() {
   // Basic test calls
@@ -427,7 +474,7 @@ int main() {
   // Alloc tests
   TEST(test_alloc_and_write, BYTES_8);
   TEST(test_alloc_edge_cases, NONE);
-  TEST(test_payload_align_on_alloc, BYTES_8);
+  TEST(test_payload_alignment_on_alloc, BYTES_8);
   TEST(test_chunk_header_data_after_alloc, BYTES_8);
   TEST(test_prev_free_flag_after_prev_chunk_has_been_allocd_again, BYTES_8_40);
   TEST(test_alloc_less_than_min_size, BYTES_8);
@@ -443,63 +490,14 @@ int main() {
   TEST(test_reuse_from_seglist_after_free, BYTES_8_40);
 
   // Realloc tests
+  TEST(test_header_after_realloc, BYTES_8);
   TEST(test_realloc_edge_cases, BYTES_8_40);
-  TEST(test_realloc_data_persistence, BYTES_8);
+  TEST(test_payload_alignment_on_realloc, BYTES_8);
+  TEST(test_realloc_data_persistence_on_expanding, BYTES_8);
+  TEST(test_realloc_data_persistence_on_shrinking, BYTES_40);
+  TEST(test_realloc_remaining_free_chunk, BYTES_8);
+  TEST(test_realloc_merging_neigbours, BYTES_8_40);
+  TEST(test_realloc_splitting_off_a_remainder, BYTES_8_40);
 
-  return 0;
+  return print_result();
 }
-///
-///static void t_remaining_chunk_size_on_realloc(void) {
-///  size_t requested_size = 10 * sizeof(size_t);
-///  size_t* free_payloads[MAX_FREE_NODES] = { NULL };
-///
-///  size_t* chunk = ulalloc(requested_size);
-///
-///  int found = extract_free_payloads_from_seglist(LAST_BUCKET, free_payloads, MAX_FREE_NODES);
-///  ASSERT(1, ==, found);
-///  if (found != 1) {
-///    ulfree(chunk);
-///    return;
-///  }
-///
-///  Header remaining_header = extract_header(free_payloads[0]);
-///  size_t expected_remaining_size = ARENA_SIZE - get_expected_chunk_size(requested_size);
-///  ASSERT(expected_remaining_size, ==, remaining_header.size);
-///
-///  // Growing in place should eat into the leftover chunk
-///  size_t new_requested_size = requested_size + 5 * sizeof(size_t);
-///  chunk = ulrealloc(chunk, new_requested_size);
-///
-///  found = extract_free_payloads_from_seglist(LAST_BUCKET, free_payloads, MAX_FREE_NODES);
-///  ASSERT(1, ==, found);
-///  if (found != 1) {
-///    ulfree(chunk);
-///    return;
-///  }
-///
-///  remaining_header = extract_header(free_payloads[0]);
-///  expected_remaining_size = ARENA_SIZE - get_expected_chunk_size(new_requested_size);
-///  ASSERT(expected_remaining_size, ==, remaining_header.size);
-///
-///  ulfree(chunk);
-///}
-///
-///static void t_seglist_state_on_realloc(void) {
-///  size_t requested_size = 10 * sizeof(size_t);
-///  size_t* chunk = ulalloc(requested_size);
-///
-///  size_t new_requested_size = requested_size + 5 * sizeof(size_t);
-///  chunk = ulrealloc(chunk, new_requested_size);
-///  ASSERT(1, ==, get_total_free_chunk_num());
-///
-///  // The new size can't fit inside the UL_MIN_ALLOC arena anymore, so realloc
-///  // frees the current chunk (which frees the whole arena) and maps a new one.
-///  // The leftover of the new mapping is not pushed to the ulseglist;
-///  // it stays inside the returned chunk as padding, so the ulseglist should be empty
-///  new_requested_size += UL_MIN_ALLOC;
-///  chunk = ulrealloc(chunk, new_requested_size);
-///  ASSERT(0, ==, get_total_free_chunk_num());
-///
-///  ulfree(chunk);
-///  ASSERT(0, ==, get_total_free_chunk_num());
-///}
